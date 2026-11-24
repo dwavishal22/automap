@@ -929,6 +929,57 @@ const HMIO = (() => {
     return { aoa, struck };
   }
 
+  /* ---------- XML Spreadsheet 2003 (Rave ALS exports, often saved as .xls or .xml) ---------- */
+  function isSpreadsheetML(u8) {
+    const head = new TextDecoder().decode(u8.subarray(0, 4000));
+    return /^\s*(?:\uFEFF)?<\?xml/.test(head) && (/progid="Excel\.Sheet"/i.test(head) || /urn:schemas-microsoft-com:office:spreadsheet/.test(head)) && /<(?:ss:)?Workbook\b/.test(head);
+  }
+  function readSpreadsheetML(u8) {
+    const text = new TextDecoder().decode(u8).replace(/^\uFEFF/, '');
+    const struckStyles = new Set();
+    const st = text.match(/<(?:ss:)?Styles>([\s\S]*?)<\/(?:ss:)?Styles>/);
+    if (st) { const re = /<(?:ss:)?Style\b([^>]*)>([\s\S]*?)<\/(?:ss:)?Style>/g; let m; while ((m = re.exec(st[1]))) { const id = attr(m[1], 'ss:ID') || attr(m[1], 'ID'); if (id && /StrikeThrough\s*=\s*"1"/i.test(m[2])) struckStyles.add(id); } }
+    const sheets = [];
+    const reWs = /<(?:ss:)?Worksheet\b([^>]*)>([\s\S]*?)<\/(?:ss:)?Worksheet>/g;
+    const reRow = /<(?:ss:)?Row\b([^>]*?)(?:\/>|>([\s\S]*?)<\/(?:ss:)?Row>)/g;
+    const reCell = /<(?:ss:)?Cell\b([^>]*?)(?:\/>|>([\s\S]*?)<\/(?:ss:)?Cell>)/g;
+    const reData = /<(?:ss:)?Data\b[^>]*>([\s\S]*?)<\/(?:ss:)?Data>/;
+    let wm;
+    while ((wm = reWs.exec(text))) {
+      const name = attr(wm[1], 'ss:Name') || attr(wm[1], 'Name') || ('Sheet' + (sheets.length + 1));
+      const aoa = [], struck = new Set();
+      let rm, ri = -1;
+      reRow.lastIndex = 0;
+      while ((rm = reRow.exec(wm[2]))) {
+        const rIdx = attr(rm[1], 'ss:Index');
+        ri = rIdx ? parseInt(rIdx, 10) - 1 : ri + 1;
+        if (!rm[2]) continue;
+        const row = [];
+        let cm, ci = -1, filled = 0, struckN = 0;
+        const rowStruck = struckStyles.has(attr(rm[1], 'ss:StyleID') || '');
+        reCell.lastIndex = 0;
+        while ((cm = reCell.exec(rm[2]))) {
+          const a = cm[1];
+          const cIdx = attr(a, 'ss:Index');
+          ci = cIdx ? parseInt(cIdx, 10) - 1 : ci + 1;
+          const dm = (cm[2] || '').match(reData);
+          // rich text arrives as HTML inside Data; keep the text only
+          const val = dm ? xdec(dm[1].replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '')).replace(/\r\n?/g, '\n') : '';
+          if (val !== '') { row[ci] = val; filled++; if (rowStruck || struckStyles.has(attr(a, 'ss:StyleID') || '') || /<(?:html:)?S>|<Strike>/i.test(dm[1])) struckN++; }
+          const merge = attr(a, 'ss:MergeAcross');
+          if (merge) ci += parseInt(merge, 10) || 0;
+        }
+        if (row.length) aoa[ri] = row;
+        if (struckN && struckN >= Math.max(1, Math.ceil(filled / 2))) struck.add(ri);
+      }
+      for (let i = 0; i < aoa.length; i++) { if (!aoa[i]) aoa[i] = []; else for (let j = 0; j < aoa[i].length; j++) if (aoa[i][j] === undefined) aoa[i][j] = ''; }
+      aoa.struck = struck;
+      sheets.push({ name, aoa });
+    }
+    if (!sheets.length) throw new Error('The XML spreadsheet has no worksheets.');
+    return { sheets };
+  }
+
   /* ---------- CSV / TSV ---------- */
   function parseCSV(text) {
     text = text.replace(/^\uFEFF/, '');
@@ -989,6 +1040,8 @@ const HMIO = (() => {
     const ext = (String(fileName).match(/\.([a-z0-9]+)$/i) || [, ''])[1].toLowerCase();
     const u8 = new Uint8Array(buf);
     const isZip = u8.length > 4 && u8[0] === 0x50 && u8[1] === 0x4B;
+    // Rave ALS and other XML Spreadsheet 2003 files, whatever their extension
+    if (!isZip && isSpreadsheetML(u8)) return readSpreadsheetML(u8);
     if (['csv', 'tsv', 'txt'].includes(ext)) {
       return { sheets: [{ name: fileName.replace(/\.[^.]+$/, '').slice(0, 31) || 'Sheet1', aoa: parseCSV(new TextDecoder().decode(u8)) }] };
     }
@@ -2014,7 +2067,23 @@ const HMCore = (() => {
     }));
   }
 
-  return { SHEET, ROLES, REQUIRED, MATCH, hnorm, colKey, sim, simKey, applySubs, push, detectRoles, detectHeaderRow, analyzeSheet, finalizeSheet, setRole, extractRecords, unionColumns, generateCdms, cdmsFromInput, cdmsCoverage, pseudoTables, sheetTarget, locStr };
+  // Which sheets of a workbook to use: revision logs, validation and history sheets stay off, and a CDMS
+  // sheet with a real Target Table column wins over sheets that would only borrow their sheet name
+  const NOT_CONTENT = /change\s*log|revision|history|validation|approval|instruction|read\s*me|cover|contents|legend|lookup|glossary|abbreviation/i;
+  function autoInclude(type, sheets) {
+    sheets.forEach(s => { s.include = false; });
+    let ok = sheets.filter(s => s.ok);
+    if (type === 'edc') { const best = ok.sort((a, b) => b.score - a.score)[0]; if (best) best.include = true; return sheets; }
+    const named = ok.filter(s => !NOT_CONTENT.test(s.name));
+    if (named.length) ok = named;
+    if (ok.some(s => s.roleSet === 'cdms')) {
+      const explicit = ok.filter(s => s.roleSet === 'cdms' && s.roles.targetTable >= 0);
+      if (explicit.length) ok = ok.filter(s => s.roleSet !== 'cdms' || s.roles.targetTable >= 0);
+    }
+    ok.forEach(s => { s.include = true; });
+    return sheets;
+  }
+  return { SHEET, ROLES, REQUIRED, autoInclude, MATCH, hnorm, colKey, sim, simKey, applySubs, push, detectRoles, detectHeaderRow, analyzeSheet, finalizeSheet, setRole, extractRecords, unionColumns, generateCdms, cdmsFromInput, cdmsCoverage, pseudoTables, sheetTarget, locStr };
 })();
 if (typeof module !== 'undefined') module.exports = HMCore;
 
@@ -2203,7 +2272,7 @@ const HMMap = (() => {
     if (sentences.length > 1 && !sentences.slice(1).some(x => /\b(if|when|then|else|unless|except)\b/i.test(x))) s = sentences[0];
     // Assign NULL, Set to null, Assign as null, "NULL" -> an empty value
     if (/^(?:assign(?:ed)?|set|hard[\s-]?code(?:d)?|populate(?:d)?|default(?:ed)?|leave|keep)?\s*(?:it\s+)?(?:to|as|with|=)?\s*(?:a\s+)?["'\u2018\u201C]?(?:null|blank|missing|empty)["'\u2019\u201D]?(?:\s+(?:value|values))?(?:\s+for\s+[A-Za-z0-9_ ,]+)?\s*[.;]?$/i.test(s)) return '';
-    let m = s.match(/^(?:set|assign(?:ed)?|hard[\s-]?code(?:d)?|default(?:ed)?|always|populate(?:d)?(?:\s+with)?|constant)\s*(?:it\s+)?(?:to|as|=|with|value)?\s*["'\u2018\u201C]?([^"'\u2019\u201D]+?)["'\u2019\u201D]?\s*[.;]?$/i);
+    let m = s.match(/^(?:set|assign(?:ed)?|hard[\s-]?code(?:d)?|default(?:ed)?|always|populate(?:d)?(?:\s+with)?|constant|map(?:ping|ped)?|move|fill(?:ed)?(?:\s+with)?|output|derive(?:d)?|value(?:\s+is)?|equals?(?:\s+to)?)\s*(?:it\s+)?(?:to|as|=|with|value)?\s*["'\u2018\u201C]?([^"'\u2019\u201D]+?)["'\u2019\u201D]?\s*[.;]?$/i);
     if (m && !/\s(if|when|from|where)\s/i.test(' ' + m[1] + ' ')) return NULL_WORD.test(m[1].trim()) ? '' : m[1].trim();
     m = s.match(/^=?\s*["'\u2018\u201C]([^"'\u2019\u201D]*)["'\u2019\u201D]?\s*[.;]?$/) || s.match(/^([A-Za-z0-9 _\-\/.]+?)["'\u2019\u201D]\s*[.;]?$/);
     if (m && m[1].trim().split(/\s+/).length <= 6) return NULL_WORD.test(m[1].trim()) ? '' : m[1].trim();
@@ -2289,7 +2358,7 @@ const HMMap = (() => {
     }
 
     // ---- 3. dates, study days and times ----
-    if (/iso\s*-?\s*8601|iso\s+format/i.test(L) && tv !== 'DCMDATE') {
+    if ((/iso\s*-?\s*8601|iso\s+format/i.test(L) || /^\s*(?:date[\s_-]*iso|iso[\s_-]*date)\s*$/i.test(L)) && tv !== 'DCMDATE') {
       const timeVar = ((L.match(/\b([A-Z][A-Z0-9_]*TIM)\b/) || [])[1]) || '';
       const o = { function: 'M_DATE_CONVERT', invar_date: rawDate(src), inval_date_format: cfg.dateFormat || 'date11.' };
       if (timeVar && K(timeVar) !== K(src)) { o.invar_time = timeVar; o.inval_time_format = 'hhmm'; }
@@ -2342,6 +2411,29 @@ const HMMap = (() => {
         return { lines, kind: 'cdms' };
       }
     }
+    // "Set to "EXTREMITY ULTRASOUND" when FA_CTE_LI.PROCCUR_EXULTRAS is not missing" and "'Y' if X is not null else 'N'"
+    m = N.match(/^(?:(?:set|assign|map|populate|output)\s*(?:it\s+)?(?:to|as|with|=)?\s*)?(['"][^'"]*['"]|[A-Z][A-Z0-9 _\-\/]*?)\s+(?:when|if|where|whenever)\s+(.+?)(?:\s*[,;]?\s*(?:else|otherwise)\s+(?:set\s+(?:to\s+)?)?(['"][^'"]*['"]|[A-Za-z_][A-Za-z0-9_ ]*))?$/i);
+    if (m && !/^(?:if|when|case)\b/i.test(N)) {
+      const c2 = parseCond(m[2], known);
+      if (c2) {
+        const groups = [{ inval_condition: c2.expr, outvar_value: valueOut(m[1], known, r.v.targetColumn), inval_ifelse: 'if', invar: c2.vars }];
+        if (m[3]) groups.push({ inval_ifelse: 'else', outvar_value: valueOut(m[3], known, r.v.targetColumn), invar: [] });
+        add({ var: c2.vars[0] || src, func: 'IFTHEN', tlogic: pj(withGroup(g, { groups })) });
+        return { lines, kind: 'cdms' };
+      }
+    }
+    // "Upcase & Assign Source Variable Labels as PRTRTs for the following - FA_AE_MA_LI.FAORRES_CHEMO"
+    if (/variable\s+labels?|field\s+labels?|\blabels?\s+of\b|sas\s*labels?|\bpre\s*text\b|\bquestion\s+text\b/i.test(N)) {
+      const refs = [...N.matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g)].map(x => ({ t: x[1], v: x[2] }));
+      const pick = refs.find(x => K(x.v) === K(src)) || refs[0] || { t: r.v.sourceTable, v: src };
+      const label = ctx.labelOf ? ctx.labelOf(pick.t || r.v.sourceTable, pick.v) : '';
+      if (label) {
+        const val = /\b(upcase|upper|uppercase|caps)\b/i.test(N) ? label.toUpperCase() : label;
+        add({ func: 'ASSIGN', tlogic: pj(withGroup(g, { inval: val })) });
+        return { lines, kind: 'cdms', note: `Label of ${pick.t ? pick.t + '.' : ''}${pick.v} from the EDC file ("${label}")` };
+      }
+      return { lines: [], kind: null, needsLabel: `${pick.t ? pick.t + '.' : ''}${pick.v}` };
+    }
     m = N.match(/^decode\s*\((.*)\)$/i);
     if (m) {
       const a = splitArgs(m[1].replace(/,\s*'\s*,/g, ',').replace(/,\s*,/g, ',')).filter(x => x && !/^['"]+$/.test(x));
@@ -2370,6 +2462,10 @@ const HMMap = (() => {
     }
     const c = parseConst(N);
     if (c !== null && !/\b(if|when|lookup|merge|from|then)\b/i.test(N)) { add({ func: 'ASSIGN', tlogic: pj(withGroup(g, { inval: c })) }); return { lines, kind: 'cdms' }; }
+    if (ctx.labelOf && src && /^[A-Za-z][A-Za-z0-9 ,\-\/()]{0,60}$/.test(N)) {
+      const own = ctx.labelOf(r.v.sourceTable, src);
+      if (own && K(own) === K(N)) { add({ func: 'ASSIGN', tlogic: pj(withGroup(g, { inval: own.toUpperCase() })) }); return { lines, kind: 'cdms', note: `The CDMS logic "${N}" is the label of ${src}; assigned in upper case like the other values of ${r.v.targetColumn}` }; }
+    }
     m = N.match(/coalesce\s*\(([^)]*)\)/i) || N.match(/first\s+non[-\s]?(?:missing|null|blank|empty)\s+(?:value\s+)?(?:of|from|among)\s+(.+)$/i);
     if (m) { const a = splitArgs(m[1].replace(/\s+(?:and|or)\s+/gi, ',')).map(x => unq(x).split('.').pop()).filter(ident); if (a.length >= 2) { add({ func: 'COALESCE', tlogic: pj(withGroup(g, { invar: a })) }); return { lines, kind: 'cdms' }; } }
     m = N.match(/^substr(?:ing)?\s*\(\s*([A-Za-z0-9_.]+)\s*,\s*(\d+)\s*(?:,\s*(\d+))?\s*\)$/i) || N.match(/^left\s*\(\s*([A-Za-z0-9_.]+)\s*,\s*(\d+)\s*\)$/i);
@@ -2474,10 +2570,14 @@ const HMMap = (() => {
     const lit = x => { const t = P.back(x).trim(); const q = t.match(/^['"](.*)['"]$/); const v = q ? q[1] : t.replace(/^['"]|['"]$/g, ''); return /^-?\d+(\.\d+)?$/.test(v) && !q ? v : `'${v.replace(/'/g, "\\'")}'`; };
     const varOf = x => { let t = P.back(x).trim(); const f = t.match(/^(?:upper|lower|trim|strip|upcase|lowcase|compress|left)\s*\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)$/i); if (f) t = f[1]; t = t.split('.').pop(); return ident(t) ? t : null; };
     for (let i = 0; i < atoms.length; i++) {
-      const a = atoms[i].trim();
+      let a = atoms[i].trim();
       if (i % 2 === 1) { out.push(/^(or|\|\|)$/i.test(a) ? 'or' : 'and'); continue; }
       let m, X, expr;
-      if ((m = a.match(/^(.+?)\s+(?:is\s+not\s+(?:null|missing|blank|empty)|is\s+(?:populated|present|available|answered|checked|ticked)|not\s+(?:null|missing|blank|empty)|(?:ne|!=|<>)\s*(?:''|""|\u0000\d+\u0000)\s*)$/i)) && (X = varOf(m[1]))) {
+      // function forms: NOT MISSING(X), MISSING(X), ISNULL(X), NOT(ISNULL(X)), NOTNULL(X), !MISSING(X)
+      a = a.replace(/^not\s*\(\s*(.+?)\s*\)$/i, 'not $1').replace(/^[!~]\s*/, 'not ');
+      if ((m = a.match(/^(not\s+)?(?:missing|isnull|is_null|isblank|isempty|blank|empty|null)\s*\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)$/i)) && (X = varOf(m[2]))) expr = `${X} ${m[1] ? '!=' : '=='} ''`;
+      else if ((m = a.match(/^(?:notnull|isnotnull|notmissing|present|exists|has_value)\s*\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\)$/i)) && (X = varOf(m[1]))) expr = `${X} != ''`;
+      if (!expr && (m = a.match(/^(.+?)\s+(?:is\s+not\s+(?:null|missing|blank|empty)|is\s+(?:populated|present|available|answered|checked|ticked)|not\s+(?:null|missing|blank|empty)|(?:ne|!=|<>)\s*(?:''|""|\u0000\d+\u0000)\s*)$/i)) && (X = varOf(m[1]))) {
         if (/\u0000/.test(a) && !/(''|"")/.test(P.back(a))) m = null; else expr = `${X} != ''`;
       }
       if (!expr && (m = a.match(/^(.+?)\s+(?:is\s+(?:null|missing|blank|empty|not\s+populated|not\s+answered)|(?:=|==|eq)\s*(?:''|""))$/i)) && (X = varOf(m[1]))) expr = `${X} == ''`;
@@ -2782,6 +2882,7 @@ const HMMap = (() => {
       groupFor: r => groupId(r),
       targetVars: () => targetVars,
       knownVar: v => isKnownVar(v) || targetVars.has(K(v)),
+      labelOf: (table, field) => { const Lb = inputs.edcLabels; if (!Lb || !Lb.size) return ''; const t = K(table).replace(/_BIOSTAT$/, ''), f = K(field); return Lb.get(t + '|' + f) || Lb.get('*|' + f) || ''; },
       preconfOut: key => { let pool = []; try { pool = lines || []; } catch (_) { pool = []; } const l = pool.find(x => /M_VISIT_PRECONF/i.test(x.tlogic)); const m = l && str(l.tlogic).match(new RegExp('["\']outvar_' + key + '["\']\\s*:\\s*["\']([^"\']+)["\']', 'i')); return m ? m[1] : null; },
       fedFrom: tv => [...new Set(rowsT.filter(r => colNorm(r.v.sourceColumn, cfg).startsWith(tv) && K(r.v.targetColumn) !== tv && !/MULTIPLE/i.test(r.v.logic)).map(r => K(r.v.targetColumn)))],
       codedVars: (t, dp) => {
@@ -2863,7 +2964,7 @@ const HMMap = (() => {
     const outsOf = x => new Set([K(x.tvar), ...logicInfo(x.tlogic).outputs].filter(Boolean));
     const producedNow = () => { const s = new Set(); lines.forEach(x => outsOf(x).forEach(o => s.add(o))); return s; };
     const supportDone = new Set();
-    const genRows = [], diffRows = [], overrideRows = [];
+    const genRows = [], diffRows = [], overrideRows = [], missingLabels = [];
     const cdmsOrder = new Map(rowsT.map((r, i) => [r, i]));
     let anchor = -5;
     const placeGen = (r, res, kind, note) => {
@@ -2939,7 +3040,8 @@ const HMMap = (() => {
         if (ov && !overrideRows.some(o => o.tv === tv)) overrideRows.push({ tv, r, missing: ov, all: ov[0] === 'ALL' });
       }
       else {
-        const ln = { id: ++uid, origin: 'placeholder', key: anchor, var: clean(r.v.sourceColumn), tvar: r.v.targetColumn, layer: 'PDL', func: '', ftype: 'OTB', blogic: '', tlogic: '', group: ctx.groupFor(r), status: 'PLACEHOLDER', note: !clean(r.v.logic) ? 'No CDMS logic and no reference line' : /\bmerge\b|\blookup\b|\bjoin\b/i.test(r.v.logic) ? 'Logic merges or looks up another dataset; consider an M_MERGE_V line before this one and write it by hand' : 'No reference line and the CDMS logic could not be translated; write this line by hand', refLoc: '', cdms: [r], truncated: false };
+        if (res.needsLabel) missingLabels.push({ r, ref: res.needsLabel });
+        const ln = { id: ++uid, origin: 'placeholder', key: anchor, var: clean(r.v.sourceColumn), tvar: r.v.targetColumn, layer: 'PDL', func: '', ftype: 'OTB', blogic: '', tlogic: '', group: ctx.groupFor(r), status: 'PLACEHOLDER', note: res.needsLabel ? `Needs the label of ${res.needsLabel} from the EDC file; add the EDC file and run again` : !clean(r.v.logic) ? 'No CDMS logic and no reference line' : /\bmerge\b|\blookup\b|\bjoin\b/i.test(r.v.logic) ? 'Logic merges or looks up another dataset; consider an M_MERGE_V line before this one and write it by hand' : 'No reference line and the CDMS logic could not be translated; write this line by hand', refLoc: '', cdms: [r], truncated: false };
         lines.push(ln);
         genRows.push({ r, lines: [ln], kind: null });
       }
@@ -3066,6 +3168,24 @@ const HMMap = (() => {
       }
     }
     const tempVars = [...new Set(ordered.map(x => K(x.tvar)).filter(v => /^TMP_/.test(v)))];
+    // SPID numbers: the transpose group's own number from the CDMS, or a sequence AUTOMAP assigns
+    const spidChanges = [];
+    if (cfg.spidSequence !== 'reference') {
+      const seqOf = new Map();
+      ordered.forEach(x => {
+        if (K(x.tvar) !== 'SPID' || !x.group || !/["']-T[^"']*["']/.test(str(x.tlogic))) return;
+        if (!seqOf.has(x.group)) seqOf.set(x.group, seqOf.size + 1);
+        const num = cfg.spidSequence === 'automap' ? String(seqOf.get(x.group)) : (x.group.match(/^[A-Za-z_]*?(\d\w*)$/) || [, ''])[1];
+        if (!num) return;
+        const before = (str(x.tlogic).match(/["'](-T[^"']*)["']/) || [])[1];
+        const after = '-T' + num;
+        if (before !== after) {
+          x.tlogic = str(x.tlogic).replace(/(["'])-T[^"']*(["'])/, `$1${after}$2`);
+          x.note = [x.note, `SPID suffix ${before} changed to ${after} to match ${cfg.spidSequence === 'automap' ? 'the sequence AUTOMAP assigns' : 'transpose group ' + x.group}`].filter(Boolean).join('. ');
+          spidChanges.push({ x, group: x.group, before, after });
+        }
+      });
+    }
 
     // ---- row level maps ----
     const merged = new Set();
@@ -3144,7 +3264,7 @@ const HMMap = (() => {
       return { r, lines: ls, status: st };
     });
     return {
-      target: T, source, libStudy: p.libStudy, primary, rowLines, lines: ordered, rowStatus, genRows, diffRows, overrideRows, sdqStatus, skipped, hazards, dupLines, tempVars,
+      target: T, source, libStudy: p.libStudy, primary, rowLines, spidChanges, missingLabels, lines: ordered, rowStatus, genRows, diffRows, overrideRows, sdqStatus, skipped, hazards, dupLines, tempVars,
       unresolved, notes, truncated: ordered.filter(x => x.truncated), refCount: p.col.length, usedRef: ordered.filter(x => x.origin === 'ref').length,
       groups: [...new Set(ordered.map(x => x.group).filter(Boolean))].length
     };
@@ -3656,6 +3776,7 @@ const HMRun = (() => {
     forwardFill: true, splitQualified: true, excludeControlTypes: [],
     derivedTables: ['DERIVED', 'SDQ'], allTargetNames: ['ALL'],
     formSuffixMode: 'ask', formSuffix: '_BIOSTAT',
+    spidSequence: 'cdms', labelEdcMode: 'ask',
     dsstdtcConventions: true, dsstdtcCompleteTerms: true, refFileCdh: true, refFilePattern: '{STUDY} reference_file_dsstdtc', struckMode: 'ask', fillMode: 'ask', predictMode: 'ask',
     fixOverwrites: true, removeDuplicates: true,
     studyId: '', filePrefix: 'AUTOMAP', includeAudit: true,
@@ -3822,6 +3943,7 @@ const HMRun = (() => {
   const VAGUE = /^(|TBD|TBC|\?+|NA|N\/A|-+|UNKNOWN|NULL|NONE|XX+)$/i;
   const VAGUE_LEN = /^(|0|TBD|TBC|\?+|NA|N\/A|-+|UNKNOWN|NULL|NONE)$/i;
   const colNorm = (c, cfg) => { let x = K(c); (cfg.colSuffixes || ['_RAW', '_STD']).forEach(sfx => { const S = K(sfx); if (S && x.endsWith(S) && x.length > S.length) x = x.slice(0, -S.length); }); return x; };
+  const LABEL_LOGIC = /variable\s+labels?|field\s+labels?|\blabels?\s+of\b|sas\s*labels?|\bpre\s*text\b|\bquestion\s+text\b/i;
   function pendingDecisions(proc, inputs, cfg) {
     const qs = [];
     const recsOf = type => { const out = []; (inputs[type] || []).forEach(({ file, sheet }) => out.push(...Core.extractRecords(sheet, file, cfg))); return out; };
@@ -3843,12 +3965,19 @@ const HMRun = (() => {
       const noRef = recsOf('edc').filter(e => !refCols.has(colNorm(e.v.fieldOID, cfg))).length;
       if (noRef) qs.push({ key: 'predictMode', count: noRef });
     }
+    if ((proc === 2 || proc === 3)) {
+      const rows = recsOf(proc === 3 ? 'cdms' : 'refCdms');
+      const need = rows.filter(r => LABEL_LOGIC.test(clean(r.v.logic))).length;
+      const hasEdc = (inputs.edc || []).length > 0 || ((inputs.__all && inputs.__all.edc) || []).some(f => f.sheets.some(s => s.include));
+      if (need && !hasEdc) qs.push({ key: 'labelEdcMode', count: need });
+    }
     return qs.filter(q => cfg[q.key] === 'ask');
   }
 
   // Page names and codelists from the other sheets of the EDC workbook (Forms, DataDictionaryEntries)
   function edcExtras(all) {
-    const formNames = new Map(), codelists = new Map(), fieldDict = new Map();
+    const formNames = new Map(), codelists = new Map(), fieldDict = new Map(), labels = new Map();
+    const cleanLabel = x => clean(String(x || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ')).replace(/\s+/g, ' ').replace(/[\s:]+$/, '').trim();
     ((all && all.edc) || []).forEach(f => f.sheets.forEach(sh => {
       const aoa = sh.aoa || [];
       for (let hr = 0; hr < Math.min(aoa.length, 10); hr++) {
@@ -3861,13 +3990,23 @@ const HMRun = (() => {
         if (dd !== undefined && coded !== undefined && fld === undefined) {
           aoa.slice(hr + 1).forEach(r => { const d = K(r[dd]), c = clean(r[coded]); if (d && c) { if (!codelists.has(d)) codelists.set(d, []); codelists.get(d).push(c); } }); break;
         }
+        if (fld !== undefined) {
+          const fo = col('FORMOID'), pre = col('PRETEXT'), sas = col('SASLABEL'), dfn = col('DRAFTFIELDNAME'), lab = col('LABEL', 'FIELDLABEL', 'QUESTIONTEXT');
+          if (pre !== undefined || sas !== undefined || lab !== undefined) aoa.slice(hr + 1).forEach(r => {
+            const fi = K(r[fld]); if (!fi) return;
+            const l = cleanLabel(pre !== undefined ? r[pre] : '') || cleanLabel(lab !== undefined ? r[lab] : '') || cleanLabel(sas !== undefined ? r[sas] : '') || cleanLabel(dfn !== undefined ? r[dfn] : '');
+            if (!l) return;
+            const form = fo !== undefined ? K(r[fo]).replace(/_BIOSTAT$/, '') : '*';
+            labels.set(form + '|' + fi, l); if (!labels.has('*|' + fi)) labels.set('*|' + fi, l);
+          });
+        }
         if (fld !== undefined && dd !== undefined) {
           const fo = col('FORMOID');
           aoa.slice(hr + 1).forEach(r => { const d = clean(r[dd]), fi = K(r[fld]); if (d && fi) { fieldDict.set((fo !== undefined ? K(r[fo]) : '*') + '|' + fi, d); fieldDict.set('*|' + fi, d); } }); break;
         }
       }
     }));
-    return { formNames, codelists, fieldDict };
+    return { formNames, codelists, fieldDict, labels };
   }
 
   /* ---------- main run ---------- */
@@ -3927,7 +4066,8 @@ const HMRun = (() => {
     let mapRes = null;
     if (proc === 2 || proc === 3) {
       const edcFields = E.recs.map(e => e.v.fieldOID).filter(Boolean);
-      mapRes = Map_.buildMaps(cdmsRows, { mapRecs: M.col, rowRecs: M.row, refCdms: R.recs, library: Lib, edcFields, refSource: proc === 2 ? 'generated' : 'linked' }, cfg);
+      const extras = edcExtras(inputs.__all);
+      mapRes = Map_.buildMaps(cdmsRows, { mapRecs: M.col, rowRecs: M.row, refCdms: R.recs, library: Lib, edcFields, edcLabels: extras.labels, refSource: proc === 2 ? 'generated' : 'linked' }, cfg);
       res.maps = flatMaps(mapRes);
       // a DS mapping needs REFERENCE_FILE_DSSTDTC for M_DSSTDTC
       if (res.maps.some(t => K(t.target) === 'DS')) {
@@ -4194,6 +4334,12 @@ const HMRun = (() => {
       const dl = T.flatMap(t => t.dupLines.map(d => [t.target, d.row ? 'Row level' : 'Column level', d.x.tvar || '(none)', d.x.func, d.first ? `Same as line ${d.first.seq}` : 'Same dataset, function and logic', d.x.refLoc || (d.x.origin === 'gen' ? 'Generated' : '')]));
       A.sections.push(table('dupLines', 'Duplicate lines removed', 'Lines identical in every column except Source Dataset, which is only there for readability. Only the first is kept so Alex does not raise errors.',
         ['Target table', 'Level', 'Target variable', 'Function', 'Duplicate of', 'Where it came from'], dl, dl.length ? 'info' : 'ok'));
+      const sp = T.flatMap(t => t.spidChanges.map(c => [t.target, c.group, c.x.seq, c.before, c.after]));
+      A.sections.push(table('spid', 'SPID suffixes', cfg.spidSequence === 'automap' ? 'Each transpose group\'s SPID ends in -T followed by a sequence AUTOMAP assigns in mapping order (Settings, SPID numbering).' : 'Each transpose group\'s SPID ends in -T followed by the group\'s own number from the CDMS, so target records trace back to the CDMS rows (Settings, SPID numbering).',
+        ['Target table', 'Transpose group', 'Sequence', 'Before', 'After'], sp, sp.length ? 'info' : 'ok'));
+      const ml = T.flatMap(t => t.missingLabels.map(x => [t.target, x.r.v.targetColumn, x.ref, x.r.v.logic, x.r.v.transpose]));
+      if (ml.length) A.sections.push(table('labels', 'Field labels needed from the EDC file', 'These CDMS rows assign a source variable\'s label. Add the EDC file (its Fields sheet has the labels in PreText or SASLabel) and run again.',
+        ['Target table', 'Target variable', 'Field', 'CDMS logic', 'Transpose'], ml, 'bad'));
       if (ctx.refFile) {
         const rf = ctx.refFile;
         A.sections.push(table('refFile', 'REFERENCE_FILE_DSSTDTC', 'M_DSSTDTC in the DS mapping reads this file to find, for each disposition term on each DS form, the date that gives DSSTDTC. AUTOMAP built it from the DSSTDTC rows of the CDMS, completed term lists from the EDC codelist and other studies, and recomputed cdh_recordid.',
@@ -4227,6 +4373,9 @@ const HMRun = (() => {
       if (ms.library.length) F.push({ cat: 'info', text: `The built-in library was the reference for ${plural(ms.library.length, 'target')}: ${ms.library.slice(0, 8).join(', ')}${ms.library.length > 8 ? '…' : ''}.`, section: 'mapSummary' });
       if (ms.support) F.push({ cat: 'info', text: `${plural(ms.support, 'support line was', 'support lines were')} added because other lines depend on them.`, section: 'support' });
       if (ctx.refFile) { const miss = ctx.refFile.data.filter(o => !o.form_val).length; F.push({ cat: miss ? 'bad' : 'info', text: `REFERENCE_FILE_DSSTDTC was created for the DS mapping with ${plural(ctx.refFile.data.length, 'row')}` + (miss ? `; ${plural(miss, 'row needs', 'rows need')} the form's page name (form_val).` : '.'), section: 'refFile' }); }
+      const spN = mapRes.targets.reduce((a, t) => a + t.spidChanges.length, 0), mlN = mapRes.targets.reduce((a, t) => a + t.missingLabels.length, 0);
+      if (spN) F.push({ cat: 'info', text: `${plural(spN, 'SPID suffix was', 'SPID suffixes were')} renumbered to match ${cfg.spidSequence === 'automap' ? 'the sequence AUTOMAP assigns' : 'the CDMS transpose group numbers'}.`, section: 'spid' });
+      if (mlN) F.push({ cat: 'bad', text: `${plural(mlN, 'line needs a field label', 'lines need field labels')} from the EDC file. Add the EDC file and run again.`, section: 'labels' });
       if (ms.hazards) F.push({ cat: 'review', text: `${plural(ms.hazards, 'line was', 'lines were')} reordered or given a TMP_ copy so ${ms.hazards === 1 ? 'it reads' : 'they read'} the raw source value instead of an overwritten one.`, section: 'hazards' });
       if (ms.dupes) F.push({ cat: 'info', text: `${plural(ms.dupes, 'duplicate mapping line was', 'duplicate mapping lines were')} removed; the first of each is kept.`, section: 'dupLines' });
       if (ms.diffs) F.push({ cat: 'review', text: `${plural(ms.diffs, 'CDMS instruction differs', 'CDMS instructions differ')} from the reference mapping.`, section: 'cdmsDiff' });
@@ -4360,7 +4509,7 @@ const HMRun = (() => {
   const SHEET_NAMES = {
     inputs: 'Input inventory', forms: 'Field coverage', unref: 'Unreferenced columns', mandatory: 'Mandatory coverage',
     mandMissing: 'Mandatory no reference', review: 'CDMS rows to review', refProfile: 'Reference CDMS profile', quality: 'CDMS quality checks',
-    refFile: 'REFERENCE_FILE_DSSTDTC', predicted: 'Predicted rows', filled: 'Attributes filled', struck: 'Struck-out rows', hazards: 'Overwrite fixes', dupLines: 'Duplicate lines removed',
+    spid: 'SPID suffixes', labels: 'Labels needed', refFile: 'REFERENCE_FILE_DSSTDTC', predicted: 'Predicted rows', filled: 'Attributes filled', struck: 'Struck-out rows', hazards: 'Overwrite fixes', dupLines: 'Duplicate lines removed',
     fixSummary: 'Corrections by type', formMatch: 'Form matching', notInEdc: 'Not in EDC', corrections: 'Corrections applied',
     edcMissing: 'EDC fields not in CDMS', edcForms: 'EDC forms not in CDMS', addedRows: 'Rows added',
     mapSummary: 'Mapping files', notImpl: 'Logic not implemented', generated: 'Generated by AUTOMAP', support: 'Support lines',
@@ -4699,11 +4848,7 @@ if (typeof module !== 'undefined') module.exports = HMRun;
   function makeEntry(type, name, size, wb) {
     const rs = Run.ROLESET[type];
     const sheets = wb.sheets.map(s => { const sh = Core.analyzeSheet(s.name, s.aoa, rs, undefined, name); sh.include = false; return sh; });
-    const ok = sheets.filter(s => s.ok);
-    if (type === 'edc') {
-      const best = ok.sort((a, b) => b.score - a.score)[0];
-      if (best) best.include = true;
-    } else ok.forEach(s => { s.include = true; });
+    Core.autoInclude(type, sheets);
     return { id: uid(), name, size, sheets };
   }
   async function addFiles(type, files) {
@@ -4911,6 +5056,7 @@ if (typeof module !== 'undefined') module.exports = HMRun;
     formSuffixMode: q => ({ title: `Add ${q.suffix} to the EDC form names?`, text: `None of the ${plural(q.count, 'form')} in the EDC file ends in ${q.suffix} (for example ${q.example.join(', ')}). Source tables in CDMS and mappings usually do, such as AE_F${q.suffix}.`, yes: ['add', `Add ${q.suffix}`], no: ['keep', 'Keep the EDC names'] }),
     struckMode: q => ({ title: 'Leave out struck-out rows?', text: `${plural(q.count, 'row is', 'rows are')} struck through in the inputs (${q.where.join('; ')}). Struck-out rows are usually withdrawn instructions.`, yes: ['skip', 'Leave them out'], no: ['keep', 'Use them anyway'] }),
     fillMode: q => ({ title: 'Fill in missing Data Type, Length and Transpose?', text: `${plural(q.count, 'reference CDMS row has', 'reference CDMS rows have')} a missing or vague value (blank, TBD, ?, 0). AUTOMAP can predict them from the reference's own conventions, naming rules and the EDC data format, and mark each one.`, yes: ['fill', 'Predict and fill them'], no: ['keep', 'Copy the reference as it is'] }),
+    labelEdcMode: q => ({ title: 'Add the EDC file for field labels?', text: `${plural(q.count, 'CDMS row assigns', 'CDMS rows assign')} a source variable's label (for example "Assign Source Variable Labels as PRTRTs"). The labels are in the EDC file's Fields sheet (PreText or SASLabel).`, yes: ['add', 'Add the EDC file now'], no: ['skip', 'Continue without labels'] }),
     predictMode: q => ({ title: 'Predict CDMS rows for EDC fields with no reference?', text: `Up to ${plural(q.count, 'EDC field has', 'EDC fields have')} no matching source column in the reference CDMS. AUTOMAP can predict their rows from field names, control types and labels, for example a transpose group with --TEST and --TESTCD for each --ORRES_<test> field.`, yes: ['predict', 'Predict rows'], no: ['list', 'Only list them'] })
   };
   function askDecisions(qs) {
@@ -4944,7 +5090,17 @@ if (typeof module !== 'undefined') module.exports = HMRun;
     if (!p) return;
     if (Run.library && !Run.library.loaded) { busy('Loading the built-in library'); await nextFrame(); try { await Run.library.ready; } catch (e) { console.error(e); toast('The built-in library could not be loaded; AUTOMAP will run without it.', 'review', 7000); } busy(null); }
     const qs = Run.pendingDecisions(p, collectInputs(), S.cfg);
-    if (qs.length) { const ans = await askDecisions(qs); if (!ans) return; Object.assign(S.cfg, ans); }
+    if (qs.length) {
+      const ans = await askDecisions(qs); if (!ans) return;
+      if (ans.labelEdcMode === 'add') {
+        // the EDC is being added for its labels, so keep building mappings rather than switching to process 4
+        delete ans.labelEdcMode; Object.assign(S.cfg, ans); S.procManual = p;
+        const inp = document.querySelector('li[data-type="edc"] input[type=file]'); if (inp) inp.click();
+        toast('Add the EDC file (for example the Rave ALS .xls), then select Run AUTOMAP again.', 'info', 8000);
+        return;
+      }
+      Object.assign(S.cfg, ans);
+    }
     busy(`Running process ${p}`);
     await nextFrame();
     try {
@@ -5442,6 +5598,8 @@ if (typeof module !== 'undefined') module.exports = HMRun;
           Run.library ? toggle('useLibrary', `Use the built-in library (${Run.library.study})`, `Mappings for 264 target tables and about 20,000 CDMS rows from ${(Run.library.studies || []).length} studies. For each target your references do not cover, AUTOMAP uses the study whose CDMS is most like yours; it also helps predict rows for EDC fields with no reference.`) : null,
           sel('conflictRule', 'When the CDMS and a reference line disagree on a simple function', [['cdms', 'Follow the CDMS and flag the line'], ['reference', 'Keep the reference line and flag it']]),
           sel('preferCdmsWhenRefBroken', 'When a reference line reads variables this study lacks', [['auto', 'Generate from the CDMS when an EDC file or the library shows they are missing'], ['always', 'Always generate from the CDMS'], ['never', 'Keep the reference line and flag it']]),
+          sel('spidSequence', 'SPID numbering for transpose groups', [['cdms', 'Use each transpose group\'s number from the CDMS (-T16 for PR16)'], ['automap', 'Let AUTOMAP number them in mapping order (-T1, -T2, ...)'], ['reference', 'Keep whatever the reference mapping had']], 'Matching numbers let target records be traced to their CDMS rows.'),
+          sel('labelEdcMode', 'CDMS logic that needs field labels', [['ask', 'Ask me for the EDC file'], ['skip', 'Continue without labels']]),
           toggle('addFinalSort', 'End every map with an M_SORT step', 'Sorts and removes duplicates by STUDYID, USUBJID, the topic variable and SPID when the reference has no sort.'),
           toggle('repairTruncated', 'Repair technical logic cut off at 255 characters', 'Closes the brackets and restores known parameters such as M_CODING variables. Repaired lines are flagged.'),
           toggle('generateSdq', 'Generate SDQ lines that no reference supplies'),
@@ -5517,9 +5675,12 @@ if (typeof module !== 'undefined') module.exports = HMRun;
         <li>TMP_ variables hold values between lines and need no target column.</li>
         <li>When the CDMS wants a raw source value that an earlier line overwrites, the reading line is moved before the overwrite or reads a TMP_ copy. A DERIVED source table means the new value is wanted, so nothing changes.</li>
         <li>Lines identical in everything but Source Dataset are duplicates; only the first is kept.</li>
+        <li>SPID for a transpose group ends in -T and the group's own CDMS number (-T16 for PR16), so target records trace back to their CDMS rows. Settings, SPID numbering, lets AUTOMAP number them in mapping order instead.</li>
+        <li>Logic that assigns a source variable's label, such as "Assign Source Variable Labels as PRTRTs", uses the label from the EDC file's Fields sheet (PreText, then SASLabel). If no EDC file is loaded, AUTOMAP asks for it.</li>
+        <li>Conditions are understood in their usual written forms: IF NOT MISSING(X), X is not missing, "VALUE" when X is not missing, Mapping as "Y", DATE_ISO and similar.</li>
       </ul>
       <h3>Large inputs and zip folders</h3>
-      <p>Sheets are read in pieces, so workbooks with hundreds of thousands of rows load in seconds. Any input slot accepts a .zip folder; every Excel and CSV file inside, including nested folders and zips, is added.</p>
+      <p>Rave ALS files saved as XML Spreadsheet 2003 (.xls or .xml) are read natively and offline. Sheets are read in pieces, so workbooks with hundreds of thousands of rows load in seconds. Any input slot accepts a .zip folder; every Excel and CSV file inside, including nested folders and zips, is added.</p>
       <h3>How a CDMS is corrected</h3>
       <p>Process 4 matches each CDMS source table to its EDC form, for example AE_F_BIOSTAT to AE_F, and checks every source column against that form's fields. It corrects near-identical field names and renames them in the logic, fixes fill-down data types such as VARCHAR3, makes transpose values consistent, removes duplicate rows and extra spaces, adds rows for EDC fields mapped on another form and fills in missing mandatory columns. Anything uncertain is flagged instead of changed, and every change is listed with its original value.</p>
       <h3>Statuses</h3>
@@ -5621,6 +5782,7 @@ if (typeof module !== 'undefined') module.exports = HMRun;
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();
+
 
 
 </script>
